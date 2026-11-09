@@ -1,0 +1,324 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.registerDrawingCreateUpdateRoutes = void 0;
+const uuid_1 = require("uuid");
+const sharing_1 = require("../../authz/sharing");
+const fileProcessing_1 = require("../../fileProcessing");
+const trash_1 = require("./trash");
+const sceneUpdate_1 = require("./sceneUpdate");
+const retainedFiles_1 = require("../storage/retainedFiles");
+const registerDrawingCreateUpdateRoutes = (app, context) => {
+    const { prisma, requireAuth, optionalAuth, asyncHandler, validateImportedDrawing, drawingCreateSchema, drawingUpdateSchema, respondWithValidationErrors, ensureTrashCollection, invalidateDrawingsCache, config, internDrawingFiles, parseJsonField, getRequestPrincipal, respondWithAuthErrorIfPresent, io, } = context;
+    // Compensate only failed creation under this request's unpublished UUID.
+    // Failed updates keep their tracked rows for version-guarded trim: another
+    // editor may be committing references to those bytes at the same time.
+    const cleanupUnreferencedInternedFiles = async (drawingId, knownBefore, processedFiles) => {
+        const candidates = Object.keys(processedFiles ?? {}).filter((fileId) => !knownBefore.has(fileId));
+        if (candidates.length === 0)
+            return;
+        try {
+            await prisma.$transaction(async (tx) => {
+                const referenced = await (0, retainedFiles_1.collectRetainedDrawingFileIds)(tx, drawingId);
+                if (!referenced)
+                    return;
+                const deletable = candidates.filter((fileId) => !referenced.has(fileId));
+                if (deletable.length === 0)
+                    return;
+                await tx.drawingFile.deleteMany({
+                    where: { drawingId, fileId: { in: deletable } },
+                });
+            });
+        }
+        catch (cleanupError) {
+            // Best-effort: a failed sweep only leaves rows for a later trim pass.
+            console.warn("[files] interned-file cleanup failed:", cleanupError);
+        }
+    };
+    const listDrawingFileIds = async (drawingId) => {
+        const rows = await prisma.drawingFile.findMany({
+            where: { drawingId },
+            select: { fileId: true },
+        });
+        return new Set(rows.map((row) => row.fileId));
+    };
+    app.post("/drawings", requireAuth, asyncHandler(async (req, res) => {
+        if (!req.user)
+            return res.status(401).json({ error: "Unauthorized" });
+        const isImportedDrawing = req.headers["x-imported-file"] === "true";
+        if (isImportedDrawing && !validateImportedDrawing(req.body)) {
+            return res.status(400).json({
+                error: "Invalid imported drawing file",
+                message: "The imported file contains potentially malicious content or invalid structure",
+            });
+        }
+        const parsed = drawingCreateSchema.safeParse(req.body);
+        if (!parsed.success) {
+            return respondWithValidationErrors(res, parsed.error.issues);
+        }
+        const payload = parsed.data;
+        const drawingName = payload.name ?? "Untitled Drawing";
+        const targetCollectionIdRaw = payload.collectionId === undefined ? null : payload.collectionId;
+        const targetCollectionId = (0, trash_1.toInternalTrashCollectionId)(targetCollectionIdRaw, req.user.id) ?? null;
+        if (targetCollectionId &&
+            !(0, trash_1.isTrashCollectionId)(targetCollectionId, req.user.id)) {
+            const collection = await prisma.collection.findFirst({
+                where: { id: targetCollectionId },
+            });
+            if (!collection)
+                return res.status(404).json({ error: "Collection not found" });
+            // If the collection belongs to someone else, check the user has editor access
+            if (collection.userId !== req.user.id) {
+                const share = await prisma.collectionShare.findFirst({
+                    where: {
+                        collectionId: targetCollectionId,
+                        granteeUserId: req.user.id,
+                        role: "edit",
+                    },
+                });
+                if (!share)
+                    return res
+                        .status(403)
+                        .json({ error: "No edit access to this collection" });
+            }
+        }
+        else if (targetCollectionIdRaw === "trash") {
+            await ensureTrashCollection(prisma, req.user.id);
+        }
+        const newDrawingId = (0, uuid_1.v4)();
+        const originalFiles = payload.files ?? {};
+        const knownFileIdsBefore = await listDrawingFileIds(newDrawingId);
+        const processedFiles = await internDrawingFiles(originalFiles, req.user.id, newDrawingId);
+        const rewritten = (0, fileProcessing_1.rewritePreviewForInternedFiles)(payload.preview ?? null, originalFiles, processedFiles);
+        const processedPreview = typeof rewritten === "string" ? rewritten : null;
+        let newDrawing;
+        try {
+            newDrawing = await prisma.drawing.create({
+                data: {
+                    id: newDrawingId,
+                    name: drawingName,
+                    elements: JSON.stringify(payload.elements),
+                    appState: JSON.stringify(payload.appState),
+                    userId: req.user.id,
+                    collectionId: targetCollectionId,
+                    preview: processedPreview,
+                    files: JSON.stringify(processedFiles),
+                },
+            });
+        }
+        catch (error) {
+            await cleanupUnreferencedInternedFiles(newDrawingId, knownFileIdsBefore, processedFiles);
+            throw error;
+        }
+        invalidateDrawingsCache();
+        return res.json({
+            ...newDrawing,
+            collectionId: (0, trash_1.toPublicTrashCollectionId)(newDrawing.collectionId, req.user.id),
+            elements: parseJsonField(newDrawing.elements, []),
+            appState: parseJsonField(newDrawing.appState, {}),
+            files: parseJsonField(newDrawing.files, {}),
+        });
+    }));
+    app.put("/drawings/:id", optionalAuth, asyncHandler(async (req, res) => {
+        const principal = await getRequestPrincipal(req);
+        const { id } = req.params;
+        const access = await (0, sharing_1.getDrawingAccess)({
+            prisma,
+            principal,
+            drawingId: id,
+        });
+        if (!(0, sharing_1.canEditDrawing)(access)) {
+            if (respondWithAuthErrorIfPresent(req, res))
+                return;
+            return res.status(404).json({
+                error: "Drawing not found",
+                message: "Drawing does not exist",
+            });
+        }
+        const existingDrawing = await prisma.drawing.findUnique({
+            where: { id },
+        });
+        if (!existingDrawing)
+            return res.status(404).json({ error: "Drawing not found" });
+        const parsed = drawingUpdateSchema.safeParse(req.body);
+        if (!parsed.success) {
+            if (config.nodeEnv === "development") {
+                console.error("[API] Validation failed", {
+                    id,
+                    errors: parsed.error.issues,
+                });
+            }
+            return respondWithValidationErrors(res, parsed.error.issues);
+        }
+        const payload = parsed.data;
+        const ownerUserId = existingDrawing.userId;
+        const actingUserId = principal?.kind === "user" ? principal.userId : ownerUserId;
+        const trashCollectionId = (0, trash_1.getUserTrashCollectionId)(ownerUserId);
+        const isSceneUpdate = payload.elements !== undefined ||
+            payload.appState !== undefined ||
+            payload.files !== undefined;
+        if (isSceneUpdate &&
+            payload.version !== undefined &&
+            payload.version !== existingDrawing.version) {
+            return res.status(409).json({
+                error: "Conflict",
+                code: "VERSION_CONFLICT",
+                message: "Drawing has changed since this editor state was loaded.",
+                currentVersion: existingDrawing.version,
+            });
+        }
+        // `version` is owned by applySceneUpdateTx for scene updates; do not set
+        // it here.
+        const data = {};
+        if (payload.name !== undefined)
+            data.name = payload.name;
+        if (payload.elements !== undefined)
+            data.elements = JSON.stringify(payload.elements);
+        if (payload.appState !== undefined)
+            data.appState = JSON.stringify(payload.appState);
+        let processedFilesForUpdate;
+        let requiredFileIdsForUpdate;
+        let knownFileIdsBeforeUpdate = null;
+        if (payload.files !== undefined) {
+            knownFileIdsBeforeUpdate = await listDrawingFileIds(id);
+            processedFilesForUpdate = await internDrawingFiles(payload.files, ownerUserId, id);
+            requiredFileIdsForUpdate = Object.entries(processedFilesForUpdate)
+                .filter(([fileId, file]) => {
+                const processedUrl = file
+                    ?.dataURL;
+                const originalUrl = payload.files?.[fileId]?.dataURL;
+                return (knownFileIdsBeforeUpdate.has(fileId) ||
+                    processedUrl === `/api/files/${id}/${fileId}` ||
+                    (typeof originalUrl === "string" &&
+                        originalUrl.startsWith("data:") &&
+                        typeof processedUrl === "string" &&
+                        processedUrl !== originalUrl));
+            })
+                .map(([fileId]) => fileId);
+            // Note: data.files is not assigned here. The union merge with the
+            // authoritative current state happens inside the transaction so a
+            // concurrent client's files are never whole-replaced away.
+        }
+        if (payload.preview !== undefined) {
+            const processedPreview = processedFilesForUpdate
+                ? (0, fileProcessing_1.rewritePreviewForInternedFiles)(payload.preview, payload.files ?? {}, processedFilesForUpdate)
+                : payload.preview;
+            data.preview =
+                typeof processedPreview === "string" ? processedPreview : null;
+        }
+        if (payload.collectionId !== undefined) {
+            if (!(0, sharing_1.isOwnerAccess)(access)) {
+                return res.status(403).json({
+                    error: "Forbidden",
+                    message: "Only the owner can move drawings between collections",
+                });
+            }
+            if (payload.collectionId === "trash") {
+                await ensureTrashCollection(prisma, ownerUserId);
+                data.collectionId =
+                    trashCollectionId;
+            }
+            else if (payload.collectionId) {
+                const ownedCollection = await prisma.collection.findFirst({
+                    where: { id: payload.collectionId, userId: actingUserId },
+                });
+                if (!ownedCollection) {
+                    const editableShare = await prisma.collectionShare.findFirst({
+                        where: {
+                            collectionId: payload.collectionId,
+                            granteeUserId: actingUserId,
+                            role: "edit",
+                        },
+                        select: { id: true },
+                    });
+                    if (!editableShare) {
+                        return res.status(404).json({ error: "Collection not found" });
+                    }
+                }
+                data.collectionId =
+                    payload.collectionId;
+            }
+            else {
+                data.collectionId = null;
+            }
+        }
+        let updatedDrawing = null;
+        try {
+            if (isSceneUpdate) {
+                const result = await (0, sceneUpdate_1.applySceneUpdateTx)({
+                    prisma,
+                    drawingId: id,
+                    parseJsonField,
+                    versionGuard: payload.version !== undefined ? payload.version : "optimistic",
+                    maxRetries: payload.version === undefined ? 2 : 0,
+                    mutate: () => ({
+                        data,
+                        incomingFiles: processedFilesForUpdate,
+                        requiredFileIds: requiredFileIdsForUpdate,
+                    }),
+                });
+                updatedDrawing = result.drawing;
+            }
+            else {
+                const updateResult = await prisma.drawing.updateMany({
+                    where: { id },
+                    data,
+                });
+                if (updateResult.count === 0) {
+                    return res.status(404).json({ error: "Drawing not found" });
+                }
+                updatedDrawing = await prisma.drawing.findFirst({
+                    where: { id },
+                });
+            }
+        }
+        catch (error) {
+            // Do not reclaim interned rows here. Under PostgreSQL READ COMMITTED,
+            // a concurrent valid save may have checked these rows without having
+            // committed its scene yet. Guarded trim reclaims unused rows and their
+            // exact S3 generations after owning the drawing's version update.
+            if ((0, sceneUpdate_1.isVersionConflict)(error)) {
+                const latestDrawing = await prisma.drawing.findFirst({
+                    where: { id },
+                    select: { version: true },
+                });
+                if (isSceneUpdate) {
+                    return res.status(409).json({
+                        error: "Conflict",
+                        code: "VERSION_CONFLICT",
+                        message: "Drawing has changed since this editor state was loaded.",
+                        currentVersion: latestDrawing?.version ?? null,
+                    });
+                }
+            }
+            throw error;
+        }
+        if (!updatedDrawing) {
+            return res.status(404).json({ error: "Drawing not found" });
+        }
+        invalidateDrawingsCache();
+        const savedElements = parseJsonField(updatedDrawing.elements, []);
+        const savedFiles = parseJsonField(updatedDrawing.files, {});
+        if (isSceneUpdate) {
+            // A peer can join after the realtime delta but before this autosave.
+            // Deliver the committed scene so that edit is eventually received.
+            io?.to(`drawing_${id}`).emit("element-update", {
+                drawingId: id,
+                persisted: true,
+                elements: savedElements,
+                files: savedFiles,
+                elementOrder: savedElements
+                    .map((element) => element?.id)
+                    .filter((elementId) => typeof elementId === "string"),
+            });
+        }
+        return res.json({
+            ...updatedDrawing,
+            collectionId: (0, trash_1.toPublicTrashCollectionId)(updatedDrawing.collectionId, ownerUserId),
+            elements: savedElements,
+            appState: parseJsonField(updatedDrawing.appState, {}),
+            files: savedFiles,
+            accessLevel: access,
+        });
+    }));
+};
+exports.registerDrawingCreateUpdateRoutes = registerDrawingCreateUpdateRoutes;

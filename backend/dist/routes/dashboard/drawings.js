@@ -1,0 +1,22 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.registerDrawingRoutes = void 0;
+const drawingRouteContext_1 = require("./drawingRouteContext");
+const drawingListRoutes_1 = require("./drawingListRoutes");
+const drawingReadRoutes_1 = require("./drawingReadRoutes");
+const drawingCreateUpdateRoutes_1 = require("./drawingCreateUpdateRoutes");
+const drawingDeleteDuplicateRoutes_1 = require("./drawingDeleteDuplicateRoutes");
+const drawingSharingRoutes_1 = require("./drawingSharingRoutes");
+const drawingSharedVisibilityRoutes_1 = require("./drawingSharedVisibilityRoutes");
+const drawingHistoryRoutes_1 = require("./drawingHistoryRoutes");
+const registerDrawingRoutes = (app, deps) => {
+    const context = (0, drawingRouteContext_1.createDrawingRouteContext)(deps);
+    (0, drawingListRoutes_1.registerDrawingListRoutes)(app, context);
+    (0, drawingReadRoutes_1.registerDrawingReadRoutes)(app, context);
+    (0, drawingCreateUpdateRoutes_1.registerDrawingCreateUpdateRoutes)(app, context);
+    (0, drawingDeleteDuplicateRoutes_1.registerDrawingDeleteDuplicateRoutes)(app, context);
+    (0, drawingSharingRoutes_1.registerDrawingSharingRoutes)(app, context);
+    (0, drawingSharedVisibilityRoutes_1.registerDrawingSharedVisibilityRoutes)(app, context);
+    (0, drawingHistoryRoutes_1.registerDrawingHistoryRoutes)(app, context);
+};
+exports.registerDrawingRoutes = registerDrawingRoutes;

@@ -1,0 +1,333 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.registerSocketHandlers = void 0;
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const cookies_1 = require("../auth/cookies");
+const authMode_1 = require("../auth/authMode");
+const sharing_1 = require("../authz/sharing");
+const socketAccess_1 = require("./socketAccess");
+const registerSocketHandlers = ({ io, prisma, authModeService, jwtSecret, }) => {
+    const roomUsers = new Map();
+    const getState = (socket) => {
+        const data = socket.data;
+        if (!data.access)
+            data.access = new Map();
+        if (!data.joinedRooms)
+            data.joinedRooms = new Set();
+        if (data.principal === undefined)
+            data.principal = null;
+        return data;
+    };
+    const toPresenceName = (value) => {
+        if (typeof value !== "string")
+            return "User";
+        const trimmed = value.trim().slice(0, 120);
+        return trimmed.length > 0 ? trimmed : "User";
+    };
+    const toPresenceInitials = (name) => {
+        // Keep consistent with frontend `getInitialsFromName`.
+        const trimmed = name.trim();
+        if (!trimmed)
+            return "U";
+        const parts = trimmed.split(/\s+/).filter(Boolean);
+        if (parts.length >= 2) {
+            return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+        }
+        return trimmed.slice(0, 2).toUpperCase();
+    };
+    const toPresenceColor = (value) => {
+        if (typeof value !== "string")
+            return "#4f46e5";
+        const trimmed = value.trim();
+        if (/^#[0-9a-fA-F]{3,8}$/.test(trimmed)) {
+            return trimmed;
+        }
+        return "#4f46e5";
+    };
+    const getSocketAuthUserId = async (token) => {
+        const authEnabled = await authModeService.getAuthEnabled();
+        if (!authEnabled) {
+            return authMode_1.BOOTSTRAP_USER_ID;
+        }
+        if (!token)
+            return null;
+        try {
+            const decoded = jsonwebtoken_1.default.verify(token, jwtSecret);
+            if (typeof decoded.userId !== "string" ||
+                typeof decoded.email !== "string" ||
+                decoded.type !== "access") {
+                return null;
+            }
+            const user = await prisma.user.findUnique({
+                where: { id: decoded.userId },
+                select: { id: true, isActive: true },
+            });
+            if (!user || !user.isActive)
+                return null;
+            return user.id;
+        }
+        catch {
+            return null;
+        }
+    };
+    io.use(async (socket, next) => {
+        try {
+            const tokenFromAuth = socket.handshake.auth?.token;
+            const tokenFromCookie = (() => {
+                const cookies = (0, cookies_1.parseCookieHeader)(socket.handshake.headers.cookie);
+                const value = cookies[cookies_1.ACCESS_TOKEN_COOKIE_NAME];
+                return typeof value === "string" && value.trim().length > 0
+                    ? value
+                    : undefined;
+            })();
+            const token = tokenFromAuth || tokenFromCookie;
+            const authEnabled = await authModeService.getAuthEnabled();
+            const userId = await getSocketAuthUserId(token);
+            const state = getState(socket);
+            if (userId) {
+                state.principal = { kind: "user", userId };
+                return next();
+            }
+            state.principal = null;
+            // Google-Docs-style "anyone with the link": allow anonymous sockets and enforce access on join-room
+            // using getDrawingAccess (which consults active link-share policies).
+            if (authEnabled)
+                return next();
+            return next(new Error("Authentication required"));
+        }
+        catch {
+            next(new Error("Authentication failed"));
+        }
+    });
+    io.on("connection", (socket) => {
+        const state = getState(socket);
+        const principal = state.principal;
+        const ACCESS_CACHE_TTL_MS = 1500;
+        const getCachedOrFreshAccess = async (drawingId) => {
+            const cached = state.access.get(drawingId);
+            const now = Date.now();
+            if (cached && now - cached.checkedAtMs < ACCESS_CACHE_TTL_MS) {
+                return cached.access;
+            }
+            const access = await (0, sharing_1.getDrawingAccess)({
+                prisma,
+                principal,
+                drawingId,
+            });
+            if (!(0, sharing_1.canViewDrawing)(access)) {
+                state.access.delete(drawingId);
+                return null;
+            }
+            const normalized = access === "owner" ? "owner" : access;
+            state.access.set(drawingId, { access: normalized, checkedAtMs: now });
+            return normalized;
+        };
+        // Drop this socket's presence from a drawing it can no longer access.
+        const dropDrawingAccess = (drawingId) => {
+            const roomId = `drawing_${drawingId}`;
+            const changed = (0, socketAccess_1.removeSocketFromRooms)(roomUsers, [roomId], socket.id);
+            for (const changedRoomId of changed) {
+                io.to(changedRoomId).emit("presence-update", roomUsers.get(changedRoomId) ?? []);
+            }
+            state.joinedRooms.delete(roomId);
+            socket.leave(roomId);
+        };
+        socket.on("join-room", async ({ drawingId, user, }, ack) => {
+            try {
+                const access = await getCachedOrFreshAccess(drawingId);
+                if (!access) {
+                    socket.emit("error", {
+                        message: "You do not have access to this drawing",
+                    });
+                    return;
+                }
+                const roomId = `drawing_${drawingId}`;
+                socket.join(roomId);
+                state.joinedRooms.add(roomId);
+                let trustedUserId = typeof user?.id === "string" && user.id.trim().length > 0
+                    ? user.id.trim().slice(0, 200)
+                    : socket.id;
+                let trustedName = toPresenceName(user?.name);
+                if (!principal) {
+                    // Never trust client-provided ids for anonymous/share-link sessions; prevent spoofing/collisions.
+                    trustedUserId = `anon:${socket.id}`.slice(0, 200);
+                }
+                else if (principal?.kind === "user" &&
+                    principal.userId !== authMode_1.BOOTSTRAP_USER_ID) {
+                    const account = await prisma.user.findUnique({
+                        where: { id: principal.userId },
+                        select: { id: true, name: true },
+                    });
+                    if (account) {
+                        trustedUserId = account.id;
+                        trustedName = toPresenceName(account.name);
+                    }
+                    else {
+                        // Lookup failed mid-session: fall back to a server-derived id
+                        // rather than echoing the client-supplied one.
+                        trustedUserId = `anon:${socket.id}`.slice(0, 200);
+                    }
+                }
+                else {
+                    // Bootstrap (auth disabled) sessions are server-derived too.
+                    trustedUserId = `anon:${socket.id}`.slice(0, 200);
+                }
+                const newUser = {
+                    id: trustedUserId,
+                    name: trustedName,
+                    initials: toPresenceInitials(trustedName),
+                    color: toPresenceColor(user?.color),
+                    socketId: socket.id,
+                    isActive: true,
+                };
+                // Presence is keyed per-SOCKET, not per-user id: two tabs of the
+                // same account are two independent participants. Filtering by id
+                // here would orphan the first tab's socket inside the room — its
+                // events silently dropped and its disconnect never announced.
+                const currentUsers = roomUsers.get(roomId) || [];
+                const filteredUsers = currentUsers.filter((u) => u.socketId !== socket.id);
+                filteredUsers.push(newUser);
+                roomUsers.set(roomId, filteredUsers);
+                io.to(roomId).emit("presence-update", filteredUsers);
+                // Let the client know what the server will use as its canonical presence identity.
+                if (typeof ack === "function") {
+                    ack({
+                        user: {
+                            id: newUser.id,
+                            name: newUser.name,
+                            initials: newUser.initials,
+                            color: newUser.color,
+                        },
+                    });
+                }
+            }
+            catch (err) {
+                console.error("Error in join-room handler:", err);
+                socket.emit("error", { message: "Failed to join room" });
+            }
+        });
+        socket.on("cursor-move", async (data) => {
+            const drawingId = typeof data?.drawingId === "string" ? data.drawingId : null;
+            if (!drawingId || !state.access.has(drawingId)) {
+                return;
+            }
+            // Re-validate through the TTL cache so revoked collaborators stop
+            // broadcasting cursors (rather than trusting the stale join-time grant).
+            const access = await getCachedOrFreshAccess(drawingId);
+            if (!access) {
+                dropDrawingAccess(drawingId);
+                return;
+            }
+            const roomId = `drawing_${drawingId}`;
+            // Don't trust client-provided identity fields; use the server-side presence user.
+            const users = roomUsers.get(roomId) || [];
+            const self = users.find((u) => u.socketId === socket.id);
+            if (!self)
+                return;
+            socket.volatile.to(roomId).emit("cursor-move", {
+                ...data,
+                drawingId,
+                userId: self.id,
+                username: self.name,
+                color: self.color,
+            });
+        });
+        socket.on("element-update", async (data) => {
+            const drawingId = typeof data?.drawingId === "string" ? data.drawingId : null;
+            if (!drawingId || !state.access.has(drawingId)) {
+                return;
+            }
+            // Enforce edit permission for every mutation event. Mutations bypass
+            // the short-TTL access cache so a just-revoked collaborator cannot
+            // ride the stale window to keep writing.
+            let joinedAccess;
+            try {
+                const fresh = await (0, sharing_1.getDrawingAccess)({ prisma, principal, drawingId });
+                joinedAccess = (0, sharing_1.canViewDrawing)(fresh)
+                    ? fresh === "owner"
+                        ? "owner"
+                        : fresh
+                    : null;
+                if (!joinedAccess) {
+                    state.access.delete(drawingId);
+                }
+                else {
+                    state.access.set(drawingId, {
+                        access: joinedAccess,
+                        checkedAtMs: Date.now(),
+                    });
+                }
+            }
+            catch (error) {
+                state.access.delete(drawingId);
+                console.error("Failed to revalidate socket edit access:", error);
+                return;
+            }
+            if (!joinedAccess) {
+                dropDrawingAccess(drawingId);
+                return;
+            }
+            if (!(0, sharing_1.canEditDrawing)(joinedAccess)) {
+                socket.emit("error", {
+                    message: "Read-only access: cannot edit this drawing",
+                });
+                return;
+            }
+            const roomId = `drawing_${drawingId}`;
+            socket.to(roomId).emit("element-update", data);
+        });
+        socket.on("user-activity", async ({ drawingId, isActive, }) => {
+            if (typeof drawingId !== "string" || !state.access.has(drawingId)) {
+                return;
+            }
+            // Re-validate so revoked collaborators stop broadcasting presence.
+            const access = await getCachedOrFreshAccess(drawingId);
+            if (!access) {
+                dropDrawingAccess(drawingId);
+                return;
+            }
+            const roomId = `drawing_${drawingId}`;
+            const users = roomUsers.get(roomId);
+            if (users) {
+                const user = users.find((u) => u.socketId === socket.id);
+                if (user) {
+                    user.isActive = isActive;
+                    io.to(roomId).emit("presence-update", users);
+                }
+            }
+        });
+        socket.on("disconnect", () => {
+            // Only scan the rooms this socket actually joined instead of every room.
+            const changed = (0, socketAccess_1.removeSocketFromRooms)(roomUsers, [...state.joinedRooms], socket.id);
+            for (const roomId of changed) {
+                io.to(roomId).emit("presence-update", roomUsers.get(roomId) ?? []);
+            }
+            state.joinedRooms.clear();
+            state.access.clear();
+        });
+    });
+    const revalidateDrawingAccess = async (drawingId) => {
+        const roomId = `drawing_${drawingId}`;
+        const socketIds = io.sockets.adapter.rooms.get(roomId);
+        if (!socketIds || socketIds.size === 0)
+            return;
+        const sockets = [];
+        for (const socketId of [...socketIds]) {
+            const socket = io.sockets.sockets.get(socketId);
+            if (socket)
+                sockets.push(socket);
+        }
+        await (0, socketAccess_1.revalidateRoomSockets)({
+            prisma,
+            drawingId,
+            roomUsers,
+            sockets,
+            emitPresence: (rid, users) => io.to(rid).emit("presence-update", users),
+        });
+    };
+    return { revalidateDrawingAccess };
+};
+exports.registerSocketHandlers = registerSocketHandlers;

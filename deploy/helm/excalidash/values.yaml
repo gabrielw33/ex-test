@@ -1,0 +1,177 @@
+global:
+  imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  annotations: {}
+  name: ""
+
+frontend:
+  replicaCount: 1
+  image:
+    repository: your-registry.example.com/excalidash-frontend
+    tag: sticky-notes
+    pullPolicy: IfNotPresent
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    fsGroup: 101
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    # Prisma selects a provider-specific native client under /app/dist/generated
+    # during startup, so the backend image cannot use a read-only root filesystem.
+    readOnlyRootFilesystem: false
+    runAsGroup: 101
+    runAsNonRoot: true
+    runAsUser: 101
+  service:
+    type: ClusterIP
+    port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  startupProbe:
+    enabled: true
+    failureThreshold: 30
+    periodSeconds: 2
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 20
+    timeoutSeconds: 2
+    failureThreshold: 3
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
+backend:
+  # SQLite requires a single backend writer.
+  replicaCount: 1
+  image:
+    repository: your-registry.example.com/excalidash-backend
+    tag: sticky-notes
+    pullPolicy: IfNotPresent
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    fsGroup: 1001
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+    runAsGroup: 1001
+    runAsNonRoot: true
+    runAsUser: 1001
+  service:
+    type: ClusterIP
+    port: 8000
+  authMode: local
+  trustProxy: "1"
+  enforceHttpsRedirect: true
+  frontendUrl: ""
+  runMigrations: true
+  migrationLockTimeoutSeconds: 120
+  uploadMaxMb: 100
+  bodyLimitMb: 50
+  fileUploadMaxMb: 100
+  existingSecret: ""
+  secretKeys:
+    jwt: jwt-secret
+    csrf: csrf-secret
+  # Leave empty to generate and retain secrets in a Kubernetes Secret.
+  secrets:
+    jwt: ""
+    csrf: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  startupProbe:
+    enabled: true
+    failureThreshold: 60
+    periodSeconds: 2
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+  # Protect the SQLite database when the Helm release is removed.
+  resourcePolicy: keep
+
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+  hosts:
+    - host: excalidash.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: excalidash-tls
+      hosts:
+        - excalidash.example.com
+
+networkPolicy:
+  enabled: false
+  ingressNamespaceSelector: {}
+  ingressPodSelector: {}
+
+podDisruptionBudget:
+  frontend:
+    enabled: false
+    minAvailable: 1

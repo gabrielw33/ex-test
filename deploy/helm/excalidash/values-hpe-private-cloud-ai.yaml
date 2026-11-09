@@ -1,0 +1,32 @@
+# Example overlay for HPE Private Cloud AI. Replace every example value before
+# installation. The exact storage and ingress class names depend on the cluster.
+global:
+  imagePullSecrets:
+    - name: hpe-registry-credentials
+
+frontend:
+  image:
+    repository: registry.example.hpe.local/apps/excalidash-frontend
+    tag: sticky-notes
+
+backend:
+  image:
+    repository: registry.example.hpe.local/apps/excalidash-backend
+    tag: sticky-notes
+
+persistence:
+  storageClass: ""
+  size: 10Gi
+
+ingress:
+  className: ""
+  annotations: {}
+  hosts:
+    - host: excalidash.apps.example.hpe.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: excalidash-tls
+      hosts:
+        - excalidash.apps.example.hpe.local

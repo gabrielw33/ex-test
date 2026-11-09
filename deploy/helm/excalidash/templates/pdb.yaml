@@ -1,0 +1,13 @@
+{{- if .Values.podDisruptionBudget.frontend.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "excalidash.fullname" . }}-frontend
+  labels:
+    {{- include "excalidash.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.frontend.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "excalidash.componentLabels" (dict "root" . "component" "frontend") | nindent 6 }}
+{{- end }}

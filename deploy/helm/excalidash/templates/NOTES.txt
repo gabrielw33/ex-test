@@ -1,0 +1,17 @@
+{{- if .Values.ingress.enabled }}
+ExcaliDash is available at:
+{{- range .Values.ingress.hosts }}
+  {{ ternary "https" "http" (gt (len $.Values.ingress.tls) 0) }}://{{ .host }}
+{{- end }}
+{{- else }}
+Forward the frontend service locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "excalidash.frontendServiceName" . }} 8080:{{ .Values.frontend.service.port }}
+
+Then open http://127.0.0.1:8080
+{{- end }}
+
+Check the rollout:
+  kubectl -n {{ .Release.Namespace }} get pods,svc,ingress,pvc
+
+SQLite data claim:
+  {{ include "excalidash.persistenceClaimName" . }}

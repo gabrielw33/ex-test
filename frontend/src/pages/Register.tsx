@@ -1,0 +1,309 @@
+import React, { useEffect, useState } from "react";
+import { useNavigate, Link } from "react-router-dom";
+import { Check, Copy } from "lucide-react";
+import { useAuth } from "../context/AuthContext";
+import { Logo } from "../components/Logo";
+import * as api from "../api";
+import { getPasswordPolicy, validatePassword } from "../utils/passwordPolicy";
+import { PasswordRequirements } from "../components/PasswordRequirements";
+import { AuthStatusErrorPanel } from "../components/AuthStatusErrorPanel";
+
+export const Register: React.FC = () => {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [setupCode, setSetupCode] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [copiedBootstrapCmd, setCopiedBootstrapCmd] = useState(false);
+  const {
+    register,
+    authEnabled,
+    registrationEnabled,
+    authStatusError,
+    retryAuthStatus,
+    oidcEnabled,
+    oidcEnforced,
+    oidcProvider,
+    bootstrapRequired,
+    authOnboardingRequired,
+    isAuthenticated,
+    loading: authLoading,
+  } = useAuth();
+  const navigate = useNavigate();
+
+  const passwordPolicy = getPasswordPolicy();
+
+  const bootstrapLogsCommand =
+    'docker compose -f docker-compose.prod.yml logs backend --tail=200 | grep "BOOTSTRAP SETUP"';
+
+  const copyBootstrapCommand = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(bootstrapLogsCommand);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = bootstrapLogsCommand;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      setCopiedBootstrapCmd(true);
+      window.setTimeout(() => setCopiedBootstrapCmd(false), 1500);
+    } catch {
+      // Clipboard access can be denied by the browser; the command remains visible.
+    }
+  };
+
+  useEffect(() => {
+    if (authStatusError) return;
+    if (authLoading || authEnabled === null) return;
+    if (authOnboardingRequired) {
+      navigate("/auth-setup", { replace: true });
+      return;
+    }
+    if (oidcEnforced) {
+      api.startOidcSignIn("/");
+      return;
+    }
+    if (!authEnabled) {
+      navigate("/", { replace: true });
+      return;
+    }
+    if (!bootstrapRequired && !registrationEnabled) {
+      navigate("/login", { replace: true });
+      return;
+    }
+    if (isAuthenticated) {
+      navigate("/", { replace: true });
+    }
+  }, [
+    authEnabled,
+    authLoading,
+    authOnboardingRequired,
+    authStatusError,
+    bootstrapRequired,
+    isAuthenticated,
+    navigate,
+    oidcEnforced,
+    registrationEnabled,
+  ]);
+
+  if (authStatusError) {
+    return (
+      <AuthStatusErrorPanel
+        message={authStatusError}
+        onRetry={retryAuthStatus}
+        fullScreen
+      />
+    );
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+
+    const passwordError = validatePassword(password, passwordPolicy);
+    if (passwordError) {
+      setError(passwordError);
+      return;
+    }
+    if (bootstrapRequired && setupCode.trim().length === 0) {
+      setError("Bootstrap setup code is required");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      await register(
+        email,
+        password,
+        name,
+        bootstrapRequired ? setupCode : undefined,
+      );
+      navigate("/");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to register";
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOidcBootstrap = () => {
+    setError("");
+    api.startOidcSignIn("/");
+  };
+
+  return (
+    <div className="auth-page">
+      <div className="auth-wrap">
+        <div className="text-center">
+          <Logo className="mx-auto h-12 w-auto" />
+          <h2 className="auth-heading">
+            {bootstrapRequired ? "Set up admin account" : "Create your account"}
+          </h2>
+          <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
+            {bootstrapRequired ? (
+              <span>Create the first admin account.</span>
+            ) : (
+              <>
+                Or{" "}
+                <Link to="/login" className="ui-link">
+                  sign in to your existing account
+                </Link>
+              </>
+            )}
+          </p>
+        </div>
+        <form className="auth-panel" onSubmit={handleSubmit}>
+          {bootstrapRequired && (
+            <div className="rounded-xl border-2 border-amber-200 bg-amber-50 p-3 text-left text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+              <div className="font-semibold">One-time setup code</div>
+              <div className="mt-1 text-amber-800 dark:text-amber-200">
+                Copy it from the backend logs:
+              </div>
+              <div className="mt-2 rounded bg-white dark:bg-neutral-900 p-2">
+                <div className="flex items-start gap-2">
+                  <pre className="min-w-0 flex-1 whitespace-pre-wrap break-words text-[11px] leading-snug">
+                    <code className="select-all">{bootstrapLogsCommand}</code>
+                  </pre>
+                  <button
+                    type="button"
+                    onClick={() => void copyBootstrapCommand()}
+                    className="ui-icon-button h-7 w-7 shrink-0"
+                    aria-label={
+                      copiedBootstrapCmd
+                        ? "Copied docker command"
+                        : "Copy docker command"
+                    }
+                    title={copiedBootstrapCmd ? "Copied" : "Copy"}
+                  >
+                    {copiedBootstrapCmd ? (
+                      <Check size={14} />
+                    ) : (
+                      <Copy size={14} />
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {error && (
+            <div className="ui-alert-error">
+              <div>{error}</div>
+            </div>
+          )}
+
+          {bootstrapRequired && oidcEnabled && !oidcEnforced && (
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={handleOidcBootstrap}
+                disabled={loading}
+                className="ui-button-secondary w-full"
+              >
+                Set up admin with {oidcProvider || "OIDC"}
+              </button>
+              <div className="text-center text-xs text-gray-500 dark:text-gray-400">
+                Or use a local account
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-md shadow-sm space-y-4">
+            <div>
+              <label htmlFor="name" className="sr-only">
+                Name
+              </label>
+              <input
+                id="name"
+                name="name"
+                type="text"
+                autoComplete="name"
+                required
+                className="ui-input block w-full"
+                placeholder="Your name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </div>
+            <div>
+              <label htmlFor="email" className="sr-only">
+                Email address
+              </label>
+              <input
+                id="email"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                className="ui-input block w-full"
+                placeholder="Email address"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+            <div>
+              <label htmlFor="password" className="sr-only">
+                Password
+              </label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                required
+                minLength={passwordPolicy.minLength}
+                maxLength={passwordPolicy.maxLength}
+                pattern={passwordPolicy.patternHtml}
+                className="ui-input block w-full"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
+              <PasswordRequirements
+                password={password}
+                policy={passwordPolicy}
+                className="text-gray-600 dark:text-gray-400"
+              />
+            </div>
+            {bootstrapRequired && (
+              <div>
+                <label htmlFor="setupCode" className="sr-only">
+                  Bootstrap setup code
+                </label>
+                <input
+                  id="setupCode"
+                  name="setupCode"
+                  type="text"
+                  autoComplete="one-time-code"
+                  required
+                  className="ui-input block w-full border-amber-300 dark:border-amber-700"
+                  placeholder="One-time setup code"
+                  value={setupCode}
+                  onChange={(e) => setSetupCode(e.target.value.toUpperCase())}
+                />
+              </div>
+            )}
+          </div>
+
+          <div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="ui-button-primary w-full"
+            >
+              {loading ? "Creating account..." : "Create account"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};

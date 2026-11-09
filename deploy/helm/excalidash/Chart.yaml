@@ -1,0 +1,17 @@
+apiVersion: v2
+name: excalidash
+description: ExcaliDash workspace with Excalidraw, collaboration, and persistent SQLite storage
+type: application
+version: 0.1.0
+appVersion: "0.6.7"
+kubeVersion: ">=1.25.0-0"
+home: https://excalidash.xyz
+sources:
+  - https://github.com/ZimengXiong/ExcaliDash
+keywords:
+  - excalidraw
+  - collaboration
+  - whiteboard
+  - hpe-private-cloud-ai
+maintainers:
+  - name: ExcaliDash maintainers

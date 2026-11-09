@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "excalidash.fullname" . }}-test-connection"
+  labels:
+    {{- include "excalidash.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.global.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: wget
+      image: "{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag }}"
+      imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+      command:
+        - wget
+        - --quiet
+        - --spider
+        - --timeout=10
+        - http://{{ include "excalidash.frontendServiceName" . }}:{{ .Values.frontend.service.port }}/
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 65534
